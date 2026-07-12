@@ -1,0 +1,260 @@
+# infra-automation
+
+Terraform IaC that provisions the AWS infrastructure for the **juice-shop DevSecOps pipeline**: a build/CI host (self-hosted GitHub Actions runner) and an application host that runs the OWASP Juice Shop container pulled from ECR.
+
+The two hosts are deliberately split:
+
+| Host | Role in the pipeline |
+| --- | --- |
+| **github-runner** | Executes GitHub Actions jobs — builds the Juice Shop image, runs security scans, pushes to ECR. |
+| **app-server** | Deployment target. Receives `docker pull`/`docker run` instructions **over AWS SSM** (no SSH, no inbound ports). |
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    USER(["Internet"])
+
+    subgraph GH["GitHub"]
+        WF["Actions Workflow<br/>juice-shop-devsecops-pipelin"]
+        REG["Self-hosted runner<br/>labels: aws, ec2, juice-shop"]
+    end
+
+    subgraph AWS["AWS — ca-central-1"]
+        ECR[("ECR: juice-shop<br/>external, not managed here")]
+        SSM{{"Systems Manager"}}
+
+        subgraph VPC["VPC main — 10.0.0.0/16"]
+            subgraph PUB["Public subnets x3 — 10.0.101-103.0/24"]
+                RUN["github-runner<br/>t2.large, 60 GB gp3<br/>sg: main<br/>role: github-runner-role"]
+                APP["app-server<br/>t3.small, Juice Shop :3000<br/>sg: app-server<br/>role: app-server-role"]
+            end
+            subgraph PRIV["Private subnets x3 — 10.0.1-3.0/24"]
+                NAT["3x NAT Gateway"]
+            end
+        end
+    end
+
+    WF -->|"dispatch job"| RUN
+    RUN -.->|"self-registers at boot via PAT"| REG
+    RUN -->|"docker build, push"| ECR
+    RUN -->|"aws ssm send-command"| SSM
+    SSM -->|"AWS-RunShellScript"| APP
+    APP -->|"docker pull"| ECR
+    USER -->|"TCP 3000"| APP
+
+    classDef ec2 fill:#ff9900,stroke:#232f3e,stroke-width:2px,color:#232f3e
+    classDef svc fill:#232f3e,stroke:#232f3e,color:#ffffff
+    classDef ext fill:#f5f5f5,stroke:#999999,stroke-dasharray:4 3,color:#333333
+    class RUN,APP ec2
+    class SSM,ECR svc
+    class WF,REG,USER ext
+```
+
+> **ECR is an external dependency** — the `juice-shop` repository is *not* created by this Terraform config.
+
+**Deployment is SSH-less by design.** The pipeline never opens port 22 or holds an SSH key — it drives the app-server through `aws ssm send-command`, authenticated by IAM. Both instances register with SSM via `AmazonSSMManagedInstanceCore`.
+
+---
+
+## Versions
+
+**Provider**
+- `hashicorp/aws` `~> 6.54.0`
+
+**Modules**
+- `terraform-aws-modules/vpc/aws` `6.6.0`
+- `terraform-aws-modules/ec2-instance/aws` `6.4.0`
+
+Both instances use the Canonical AMI `ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-*` (Ubuntu 22.04), resolved dynamically at plan time by `data.aws_ami.ubuntu`.
+
+---
+
+## Resources created
+
+**IAM**
+- Role `app-server-role` → instance profile `app-server-role`
+  - `AmazonSSMManagedInstanceCore` — lets the SSM agent register + accept commands
+  - `AmazonEC2ContainerRegistryFullAccess` — pull images from ECR
+- Role `github-runner-role` → instance profile `github-runner-role`
+  - `AmazonSSMManagedInstanceCore` — required for SSM agent registration
+  - `AmazonSSMFullAccess` — lets the runner issue `ssm send-command` to the app-server
+  - `AmazonEC2ContainerRegistryFullAccess` — push images to ECR
+
+**Networking**
+- VPC `main` — `10.0.0.0/16`, 3 public + 3 private subnets across all AZs, NAT gateways, VPN gateway
+- Security group `main` — all traffic from `10.0.0.0/16`; all egress. Used by github-runner.
+- Security group `app-server` — all traffic from `10.0.0.0/16`, **TCP 3000 from `0.0.0.0/0`** (Juice Shop UI); all egress.
+
+**Compute**
+- `module.ec2_app_server` — `t3.small`, public subnet, `app-server` SG, `app-server-role`
+- `module.ec2_github_runner` — `t2.large`, 60 GB gp3 root volume, public subnet, `main` SG, `github-runner-role`, `user_data_replace_on_change = true`
+
+---
+
+## Bootstrap scripts (`scripts/`)
+
+Rendered by `templatefile()` in `locals.tf` and passed as EC2 `user_data`. Cloud-init runs them as **root** on first boot only.
+
+### `script.tpl` → app-server
+Installs Docker and the AWS CLI, adds `ubuntu` to the `docker` group. Nothing else — the app-server is a passive target; the pipeline drives it over SSM.
+
+### `script-github.tpl` → github-runner
+Fully unattended self-hosted runner registration:
+
+1. Installs Docker, AWS CLI v2, `jq`.
+2. **Mints a fresh runner registration token at every boot** by calling
+   `POST /repos/{owner}/{repo}/actions/runners/registration-token` with the `github_pat`.
+3. Runs `config.sh --unattended --replace` **as the `ubuntu` user** (the GitHub runner refuses to configure as root), with labels `aws,ec2,juice-shop`.
+4. Installs and starts the runner as a systemd service (`svc.sh install ubuntu`).
+5. Logs everything to **`/var/log/github-runner-setup.log`** and exits non-zero if the token call fails.
+
+> **Why a PAT and not a registration token?** GitHub registration tokens are **single-use and expire in ~1 hour**, so one hard-coded in `terraform.tfvars` cannot survive an instance replacement. The instance mints its own token on each boot, which is what makes `terraform apply` fully self-contained — no manual `config.sh`, no SSH.
+
+---
+
+## Prerequisites
+
+### 1. The `iac-user` IAM user
+
+Terraform authenticates as a dedicated IAM user, **`iac-user`**, with an access key. Attached policies:
+
+| Policy | Why it's needed |
+| --- | --- |
+| `AmazonEC2FullAccess` | EC2 instances, VPC, subnets, route tables, gateways, security groups |
+| `IAMFullAccess` | Create the roles, policy attachments, and instance profiles |
+| `AmazonSSMReadOnlyAccess` | The ec2-instance module reads the SSM public parameter for the default AMI |
+
+> ⚠️ `IAMFullAccess` is very broad — it permits privilege escalation (this user can grant itself anything). It is acceptable for a lab, but see [Security notes](#security-notes) before reusing this pattern.
+
+### 2. A GitHub Personal Access Token
+
+Used by the runner to mint registration tokens.
+
+- **Fine-grained** (preferred): scoped to the `juice-shop-devsecops-pipelin` repo, permission **Repository → Administration: Read and write**.
+- **Classic**: `repo` scope.
+
+---
+
+## Configuration
+
+Create **`terraform.tfvars`** in the project root (it is git-ignored — see [Security notes](#security-notes)):
+
+```hcl
+aws_access_key_id     = "AKIA..."           # iac-user access key
+aws_secret_access_key = "..."               # iac-user secret
+github_pat            = "github_pat_11..."  # PAT with repo Administration: RW
+```
+
+### Declared variables (`variables.tf`)
+
+| Variable | Default | Sensitive | Description |
+| --- | --- | :---: | --- |
+| `aws_access_key_id` | `""` | | `iac-user` access key ID |
+| `aws_secret_access_key` | `""` | | `iac-user` secret access key |
+| `aws_region` | `ca-central-1` | | Target region |
+| `env_prefix` | `dev` | | Applied as the `environment` default tag |
+| `github_pat` | `""` | ✅ | PAT used to mint runner registration tokens |
+| `github_owner` | `OkomaNdu` | | GitHub org/user that owns the repo |
+| `github_repo` | `juice-shop-devsecops-pipelin` | | Repo the runner registers against |
+
+`variables.tf` *declares* variables; `terraform.tfvars` *assigns* them — including secrets, so it stays local and is never committed.
+
+---
+
+## Usage
+
+```bash
+# Initialise providers and modules
+terraform init
+
+# Preview
+terraform plan -var-file terraform.tfvars
+
+# Apply
+terraform apply -var-file terraform.tfvars
+
+# Tear everything down
+terraform destroy -var-file terraform.tfvars
+
+# show resources and components from current state
+terraform state list
+```
+
+After apply, allow ~2–3 minutes for cloud-init, then confirm the runner is **Idle** at
+*Repo → Settings → Actions → Runners*. It registers itself; there is nothing to do by hand.
+
+### Useful checks
+
+```bash
+# Which instances does SSM actually manage?
+aws ssm describe-instance-information --region ca-central-1 \
+  --query "InstanceInformationList[].[InstanceId,PingStatus]" --output table
+
+# Confirm the runner's root volume
+terraform state show 'module.ec2_github_runner.aws_instance.this[0]' | grep -A 12 root_block_device
+
+# Read the runner bootstrap log (no SSH — SSM only)
+aws ssm start-session --target <instance-id> --region ca-central-1
+sudo cat /var/log/github-runner-setup.log
+```
+
+### Forcing a rebuild of the runner
+
+`user_data_replace_on_change = true` means **any edit to `script-github.tpl` replaces the instance**, so the new script actually runs. Editing `user_data` *without* replacement would only update the attribute — cloud-init runs on first boot only and would never re-execute it.
+
+Changes that do *not* alter `user_data` (e.g. volume size) update in-place and do **not** re-run the script. To force a fresh boot:
+
+```bash
+terraform apply -replace='module.ec2_github_runner.aws_instance.this[0]' -var-file terraform.tfvars
+```
+
+---
+
+## Gotchas worth knowing
+
+**`root_block_device` uses `size` / `type`, not `volume_size` / `volume_type`.**
+In ec2-instance module v6 this is a typed *object*. Terraform **silently discards** unrecognised attributes — no error, no plan diff — so a block using the v5 names is ignored entirely and the instance falls back to the AMI default (**8 GB gp2**). Always verify with `terraform state show`.
+
+**Growing an EBS volume in place does not grow the filesystem.**
+An in-place resize leaves the partition and filesystem at their old size, and Docker builds die with `no space left on device`. Replacing the instance avoids this entirely: cloud-init runs `growpart` on first boot. Prefer `-replace` over resizing a live CI host.
+
+**`AmazonSSMFullAccess` does not let the SSM *agent* register.**
+It grants the `ssm:*` **API** to a caller, but the agent needs `ssmmessages:*` / `ec2messages:*` to open a Session Manager channel — those come from `AmazonSSMManagedInstanceCore`. Without it: `Ping status: -`, "Not connected", and `send-command` fails with `InvalidInstanceId`. Both roles now carry `ManagedInstanceCore`.
+
+**Never hard-code instance IDs in the pipeline.**
+Every replacement mints a new ID, and a stale one fails with `InvalidInstanceId — Instances not in a valid state for account`. Resolve by tag instead:
+
+```bash
+INSTANCE_ID=$(aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=app-server" "Name=instance-state-name,Values=running" \
+  --query "Reservations[].Instances[].InstanceId" --output text)
+```
+
+---
+
+## Security notes
+
+This is a **lab/learning environment**. The following are known deviations from what a production DevSecOps setup should look like — listed explicitly rather than left implicit.
+
+| # | Issue | Hardening |
+| --- | --- | --- |
+| 1 | **Long-lived AWS access keys** in `terraform.tfvars` | Use an assumed IAM role, AWS SSO, or **GitHub OIDC** — no static keys at all |
+| 2 | **`IAMFullAccess` on `iac-user`** allows privilege escalation | Replace with a least-privilege policy scoped to the specific roles/profiles this stack creates |
+| 3 | **Secrets in plaintext** (`terraform.tfvars`, `terraform.tfstate`) | Move secrets to AWS Secrets Manager / SSM Parameter Store; use a remote **S3 backend with encryption + DynamoDB locking** |
+| 4 | **State is local** — no locking, no history, secrets on disk | Same as above; local state also breaks team collaboration |
+| 5 | **Root volumes unencrypted** (`encrypted = false`) | Set `encrypted = true` in `root_block_device` (KMS-backed) |
+| 6 | **Port 3000 open to `0.0.0.0/0`** | Restrict to known CIDRs, or front with an ALB + WAF. Note Juice Shop is *intentionally vulnerable* — do not expose it broadly |
+| 7 | **Long-lived PAT with repo-admin** rights | Shorten expiry and rotate; or use a GitHub App, or GitHub's ephemeral just-in-time runners |
+| 8 | **`AmazonSSMFullAccess` on the runner** is broader than needed | Scope to `ssm:SendCommand` on the specific document + target instance ARNs |
+| 9 | **Instances in public subnets** with public IPs | Move to private subnets — SSM works without inbound access, so no public IP is needed |
+
+**`.gitignore` covers `*.tfvars` and `*.tfstate`.** If either was ever committed, the secrets are in git history — rotate the AWS key and the PAT, don't just delete the file.
+
+---
+
+## Cost warning
+
+`enable_nat_gateway = true` provisions **3 NAT Gateways** (one per AZ), which bill hourly plus data processing whether or not they carry traffic. They are typically the largest line item in this stack. Run `terraform destroy` when the lab is idle.
