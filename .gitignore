@@ -1,0 +1,20 @@
+# Local .terraform directories and provider binaries
+**/.terraform/*
+
+# Secrets: contains AWS access keys and the GitHub PAT — never commit
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# State files: contain secrets in plaintext (user_data, PAT, keys)
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# CLI config
+.terraformrc
+terraform.rc
+
+# Plan output files may contain secrets
+*.tfplan
