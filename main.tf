@@ -222,6 +222,7 @@ module "ec2_app_server" {
   root_block_device = {
     volume_type           = "gp3"
     volume_size           = 16
+    encrypted             = true
     delete_on_termination = true
   }
 }
@@ -252,6 +253,7 @@ module "ec2_github_runner" {
   root_block_device = {
     type                  = "gp3"
     size                  = 60
+    encrypted             = true
     delete_on_termination = true
   }
 }

@@ -1,0 +1,43 @@
+name: Terraform Destroy
+
+# Manual only. Never add push/pull_request triggers to this workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type DESTROY (all caps) to confirm teardown of ALL infrastructure'
+        required: true
+        type: string
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+  TF_VAR_env_prefix: "dev"
+  TF_VAR_github_pat: ${{ secrets.GH_RUNNER_PAT }}
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    container:
+      image: hashicorp/terraform:latest
+    # Same approval gate as deploy: a reviewer must approve before teardown.
+    environment: production
+    steps:
+      - name: Check confirmation input
+        run: |
+          if [ "${{ inputs.confirm }}" != "DESTROY" ]; then
+            echo "Confirmation failed: got '${{ inputs.confirm }}', expected 'DESTROY'."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Plan (destroy preview)
+        run: terraform plan -destroy
+
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve
