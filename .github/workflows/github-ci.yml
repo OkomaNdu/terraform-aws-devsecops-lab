@@ -1,0 +1,125 @@
+name: Terraform
+
+on: workflow_dispatch
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+  TF_VAR_env_prefix: "dev"
+  TF_VAR_github_pat: ${{ secrets.GH_RUNNER_PAT }}
+
+jobs:
+  init:
+    runs-on: ubuntu-latest
+    container:
+      image: hashicorp/terraform:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Upload .terraform dir
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-init
+          path: |
+            .terraform/
+            .terraform.lock.hcl
+
+  validate:
+    needs: init
+    runs-on: ubuntu-latest
+    container:
+      image: hashicorp/terraform:latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download .terraform dir
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-init
+
+      # upload-artifact does not preserve the executable bit, so the provider
+      # binary comes back as 644 and Terraform cannot exec it.
+      - name: Restore provider executable bit
+        run: chmod -R +x .terraform/providers
+
+      - name: Terraform Validate
+        run: terraform validate
+
+  trivy:
+    needs: init
+    runs-on: ubuntu-latest
+    container:
+      image: aquasec/trivy:latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy config scan (JSON report)
+        run: trivy config --format json . > trivy.json
+
+      - name: Trivy config scan (fail on HIGH/CRITICAL)
+        run: trivy config --exit-code 1 --severity HIGH,CRITICAL .
+
+      - name: Upload Trivy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: trivy.json
+
+  build:
+    needs: [validate, trivy]
+    runs-on: ubuntu-latest
+    container:
+      image: hashicorp/terraform:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download .terraform dir
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-init
+
+      - name: Restore provider executable bit
+        run: chmod -R +x .terraform/providers
+
+      - name: Terraform Plan
+        run: terraform plan -out planfile
+
+      - name: Upload planfile
+        uses: actions/upload-artifact@v4
+        with:
+          name: planfile
+          path: planfile
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    container:
+      image: hashicorp/terraform:latest
+    # Requires manual approval: create an environment named "production"
+    # in repo Settings > Environments and add required reviewers.
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download .terraform dir
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-init
+
+      - name: Restore provider executable bit
+        run: chmod -R +x .terraform/providers
+
+      - name: Download planfile
+        uses: actions/download-artifact@v4
+        with:
+          name: planfile
+
+      - name: Terraform Apply
+        run: terraform apply -input=false planfile
