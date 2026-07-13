@@ -24,6 +24,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: terraform-init
+          # .terraform/ and .terraform.lock.hcl are dot-prefixed, and
+          # upload-artifact excludes hidden files by default.
+          include-hidden-files: true
           path: |
             .terraform/
             .terraform.lock.hcl
