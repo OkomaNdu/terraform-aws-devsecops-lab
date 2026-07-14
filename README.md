@@ -356,27 +356,6 @@ INSTANCE_ID=$(aws ec2 describe-instances \
 
 ---
 
-## Security notes
-
-This is a **lab/learning environment**. The following are known deviations from what a production DevSecOps setup should look like — listed explicitly rather than left implicit.
-
-| # | Status | Issue | Hardening |
-| --- | :---: | --- | --- |
-| 1 | ✅ done | Root volumes were unencrypted | `encrypted = true` set on both `root_block_device` blocks (cleared Trivy `AWS-0131`) |
-| 2 | ✅ done | State was local — no locking or history | Moved to an **encrypted S3 backend with state locking** (`use_lockfile`) |
-| 3 | ⚠️ open | **Long-lived AWS access keys** in secrets / `terraform.tfvars` | Use **GitHub OIDC** (`aws-actions/configure-aws-credentials` + an IAM role) — no static keys at all |
-| 4 | ⚠️ open | **Trivy is non-blocking** (`continue-on-error: true`) — a CRITICAL finding does **not** stop deploy | Remove `continue-on-error` from the `trivy` job so HIGH/CRITICAL blocks the pipeline; whitelist accepted findings in `.trivyignore` |
-| 5 | ⚠️ open | **The GitHub PAT lands in the state file** (rendered into `user_data`) | Store the PAT in SSM Parameter Store; have the boot script fetch it so it never passes through Terraform/state |
-| 6 | ⚠️ open | **`IAMFullAccess` + `AmazonS3FullAccess` on `iac-user`** are over-broad | Replace with least-privilege policies scoped to this stack's resources and the state bucket only |
-| 7 | ⚠️ open | **Port 3000 open to `0.0.0.0/0`** | Restrict to known CIDRs, or front with an ALB + WAF. Juice Shop is *intentionally vulnerable* — do not expose it broadly |
-| 8 | ⚠️ open | **Long-lived PAT with repo-admin** rights | Shorten expiry and rotate; or use a GitHub App / ephemeral just-in-time runners |
-| 9 | ⚠️ open | **`AmazonSSMFullAccess` on the runner** is broader than needed | Scope to `ssm:SendCommand` on the specific document + target instance ARNs |
-| 10 | ⚠️ open | **Instances in public subnets** with public IPs | Move to private subnets — SSM works without inbound access, so no public IP is needed |
-
-**`.gitignore` covers `*.tfvars` and `*.tfstate`.** If either was ever committed, the secrets are in git history — rotate the AWS key and the PAT, don't just delete the file.
-
----
-
 ## Cost warning
 
 `enable_nat_gateway = true` provisions **3 NAT Gateways** (one per AZ), which bill hourly plus data processing whether or not they carry traffic. They are typically the largest line item in this stack. Run `terraform destroy` when the lab is idle.
