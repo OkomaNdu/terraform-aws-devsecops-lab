@@ -126,10 +126,27 @@ Terraform authenticates as a dedicated IAM user, **`iac-user`**, with an access 
 | `AmazonEC2FullAccess` | EC2 instances, VPC, subnets, route tables, gateways, security groups |
 | `IAMFullAccess` | Create the roles, policy attachments, and instance profiles |
 | `AmazonSSMReadOnlyAccess` | The ec2-instance module reads the SSM public parameter for the default AMI |
+| `AmazonS3FullAccess` | Read/write the Terraform state object in the S3 backend bucket |
 
-> ⚠️ `IAMFullAccess` is very broad — it permits privilege escalation (this user can grant itself anything). It is acceptable for a lab, but see [Security notes](#security-notes) before reusing this pattern.
+> ⚠️ `IAMFullAccess` and `AmazonS3FullAccess` are both very broad. `IAMFullAccess` permits privilege escalation; `AmazonS3FullAccess` grants access to *every* bucket in the account, not just the state bucket. Acceptable for a lab — see [Security notes](#security-notes) for the least-privilege alternatives before reusing this pattern.
 
-### 2. A GitHub Personal Access Token
+### 2. The S3 state backend (created manually)
+
+State is stored remotely in S3 (see [providers.tf](providers.tf)) so that CI runs on ephemeral runners share one authoritative state:
+
+```hcl
+backend "s3" {
+  bucket       = "infra-s3-bucket-89"
+  key          = "infra/state.tfstate"
+  region       = "ca-central-1"
+  encrypt      = true          # state holds the PAT + AWS keys in plaintext
+  use_lockfile = true          # S3-native state locking (Terraform >= 1.10)
+}
+```
+
+The bucket **`infra-s3-bucket-89`** is created **out-of-band in the AWS console** — a backend cannot bootstrap the bucket that holds its own state. Create it once (with **versioning** and **Block Public Access** enabled), then `terraform init` uses it. It is intentionally *not* managed by this Terraform and survives `terraform destroy`.
+
+### 3. A GitHub Personal Access Token
 
 Used by the runner to mint registration tokens.
 
@@ -166,8 +183,12 @@ github_pat            = "github_pat_11..."  # PAT with repo Administration: RW
 
 ## Usage
 
+**The pipeline is the primary path** — apply and destroy run through GitHub Actions (see [CI/CD pipeline](#cicd-pipeline)), so every change uses the same credentials, Terraform version, remote state, and approval gate. Prefer that over running from a laptop.
+
+For local work (planning, debugging), the commands are:
+
 ```bash
-# Initialise providers and modules
+# Initialise providers, modules, and the S3 backend
 terraform init
 
 # Preview
@@ -182,6 +203,11 @@ terraform destroy -var-file terraform.tfvars
 # show resources and components from current state
 terraform state list
 ```
+
+> **The S3 backend does not read `terraform.tfvars`.** A backend authenticates only through the standard AWS credential chain, so locally you must export credentials before `init` — otherwise you get `InvalidClientTokenId`:
+> ```bash
+> export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_DEFAULT_REGION=ca-central-1
+> ```
 
 After apply, allow ~2–3 minutes for cloud-init, then confirm the runner is **Idle** at
 *Repo → Settings → Actions → Runners*. It registers itself; there is nothing to do by hand.
@@ -213,6 +239,101 @@ terraform apply -replace='module.ec2_github_runner.aws_instance.this[0]' -var-fi
 
 ---
 
+## CI/CD pipeline
+
+Terraform is driven entirely through GitHub Actions — no one runs `apply` from a laptop. Two workflows live in [.github/workflows/](.github/workflows/):
+
+| Workflow | File | Trigger | Purpose |
+| --- | --- | --- | --- |
+| **Terraform** | `github-ci.yml` | every `push`, `pull_request`, or manual | Init → validate → scan → plan → **gated apply** |
+| **Terraform Destroy** | `terraform-destroy.yml` | manual **only** | Gated, confirmed teardown of all infrastructure |
+
+### Process flow
+
+```mermaid
+flowchart TD
+    PUSH(["git push / PR / manual dispatch"]) --> INIT
+
+    subgraph CI["github-ci.yml"]
+        INIT["init<br/>terraform init<br/>uploads .terraform + lockfile"]
+        VALIDATE["validate<br/>terraform validate<br/>(non-blocking)"]
+        TRIVY["trivy<br/>IaC scan, fail on HIGH/CRITICAL<br/>(non-blocking)"]
+        BUILD["build<br/>terraform plan -out planfile<br/>uploads planfile"]
+        DEPLOY["deploy<br/>terraform apply planfile"]
+    end
+
+    INIT --> VALIDATE
+    INIT --> TRIVY
+    VALIDATE --> BUILD
+    TRIVY --> BUILD
+    BUILD --> DEPLOY
+    GATE{{"production environment<br/>required reviewer approval"}} -.gates.-> DEPLOY
+    DEPLOY --> STATE[("S3 state<br/>infra-s3-bucket-89")]
+    DEPLOY --> AWS["AWS infrastructure<br/>VPC, EC2, IAM, SSM"]
+
+    classDef job fill:#2088ff,stroke:#0b3d91,color:#ffffff
+    classDef gate fill:#ff9900,stroke:#232f3e,color:#232f3e
+    classDef store fill:#232f3e,stroke:#232f3e,color:#ffffff
+    class INIT,VALIDATE,TRIVY,BUILD,DEPLOY job
+    class GATE gate
+    class STATE,AWS store
+```
+
+State is shared between jobs two ways: **artifacts** carry the initialised `.terraform/` dir and the `planfile` from job to job (each job runs on a fresh, isolated runner), while the **S3 backend** holds the authoritative Terraform state.
+
+### `github-ci.yml` jobs
+
+1. **init** — `terraform init` (configures the S3 backend), uploads `.terraform/` + `.terraform.lock.hcl` as an artifact. `include-hidden-files: true` is required because both are dot-prefixed and `upload-artifact` skips hidden files by default.
+2. **validate** — downloads the artifact, `chmod +x` the provider binary (artifacts drop the exec bit), runs `terraform validate`.
+3. **trivy** — scans the IaC for misconfigurations, fails on HIGH/CRITICAL, uploads the JSON report.
+4. **build** — `terraform plan -out planfile`, uploads the planfile.
+5. **deploy** — applies the **exact** planfile from `build`, so what ships is what was reviewed. Gated by the `production` environment.
+
+> **The apply gate.** `deploy` declares `environment: production`. Configure that environment (*Settings → Environments → production*) with **required reviewers** so the job pauses for human approval before touching AWS. This is the GitHub equivalent of GitLab's `when: manual`. Without required reviewers, `apply` runs unattended on every push.
+
+### `terraform-destroy.yml`
+
+A deliberately separate, **manual-only** workflow — teardown must never be reachable from an automatic trigger. Three safeguards stack:
+
+1. `workflow_dispatch` only — no `push`/`pull_request`.
+2. A typed **`DESTROY`** confirmation input; the job fails immediately on any other value.
+3. The same `production` environment approval gate as `deploy`.
+
+It runs `terraform plan -destroy` first (preview in the log), then `terraform destroy -auto-approve`.
+
+**To tear down:** *Actions → Terraform Destroy → Run workflow →* type `DESTROY` *→ approve the environment.*
+
+> Because `workflow_dispatch` workflows only appear in the Actions UI when present on the repository's **default branch**, make sure this file is on the default branch or you won't see a **Run workflow** button.
+
+### Pipeline in action
+
+**CI pipeline run** — `init → validate/trivy → build → deploy`. Note `trivy` reporting a finding (red) while the pipeline continues, because the job is currently `continue-on-error`:
+
+![Terraform CI pipeline run](docs/images/ci-pipeline-run.png)
+
+**Gated destroy** — `Terraform Destroy` completed successfully via `workflow_dispatch`:
+
+![Terraform Destroy run](docs/images/terraform-destroy-run.png)
+
+**Remote state bucket** — `infra-s3-bucket-89`, created manually in the S3 console and preserved after `terraform destroy`:
+
+![S3 state backend bucket](docs/images/s3-state-bucket.png)
+
+### GitHub Actions configuration
+
+Set on the pipeline repository (*Settings → Secrets and variables → Actions*):
+
+| Kind | Name | Value |
+| --- | --- | --- |
+| Secret | `AWS_ACCESS_KEY_ID` | `iac-user` access key ID |
+| Secret | `AWS_SECRET_ACCESS_KEY` | `iac-user` secret |
+| Secret | `GH_RUNNER_PAT` | GitHub PAT (repo Administration: RW) |
+| Variable | `AWS_DEFAULT_REGION` | `ca-central-1` |
+
+> The PAT secret must **not** start with `GITHUB_` — that prefix is reserved — hence `GH_RUNNER_PAT`.
+
+---
+
 ## Gotchas worth knowing
 
 **`root_block_device` uses `size` / `type`, not `volume_size` / `volume_type`.**
@@ -239,17 +360,18 @@ INSTANCE_ID=$(aws ec2 describe-instances \
 
 This is a **lab/learning environment**. The following are known deviations from what a production DevSecOps setup should look like — listed explicitly rather than left implicit.
 
-| # | Issue | Hardening |
-| --- | --- | --- |
-| 1 | **Long-lived AWS access keys** in `terraform.tfvars` | Use an assumed IAM role, AWS SSO, or **GitHub OIDC** — no static keys at all |
-| 2 | **`IAMFullAccess` on `iac-user`** allows privilege escalation | Replace with a least-privilege policy scoped to the specific roles/profiles this stack creates |
-| 3 | **Secrets in plaintext** (`terraform.tfvars`, `terraform.tfstate`) | Move secrets to AWS Secrets Manager / SSM Parameter Store; use a remote **S3 backend with encryption + DynamoDB locking** |
-| 4 | **State is local** — no locking, no history, secrets on disk | Same as above; local state also breaks team collaboration |
-| 5 | **Root volumes unencrypted** (`encrypted = false`) | Set `encrypted = true` in `root_block_device` (KMS-backed) |
-| 6 | **Port 3000 open to `0.0.0.0/0`** | Restrict to known CIDRs, or front with an ALB + WAF. Note Juice Shop is *intentionally vulnerable* — do not expose it broadly |
-| 7 | **Long-lived PAT with repo-admin** rights | Shorten expiry and rotate; or use a GitHub App, or GitHub's ephemeral just-in-time runners |
-| 8 | **`AmazonSSMFullAccess` on the runner** is broader than needed | Scope to `ssm:SendCommand` on the specific document + target instance ARNs |
-| 9 | **Instances in public subnets** with public IPs | Move to private subnets — SSM works without inbound access, so no public IP is needed |
+| # | Status | Issue | Hardening |
+| --- | :---: | --- | --- |
+| 1 | ✅ done | Root volumes were unencrypted | `encrypted = true` set on both `root_block_device` blocks (cleared Trivy `AWS-0131`) |
+| 2 | ✅ done | State was local — no locking or history | Moved to an **encrypted S3 backend with state locking** (`use_lockfile`) |
+| 3 | ⚠️ open | **Long-lived AWS access keys** in secrets / `terraform.tfvars` | Use **GitHub OIDC** (`aws-actions/configure-aws-credentials` + an IAM role) — no static keys at all |
+| 4 | ⚠️ open | **Trivy is non-blocking** (`continue-on-error: true`) — a CRITICAL finding does **not** stop deploy | Remove `continue-on-error` from the `trivy` job so HIGH/CRITICAL blocks the pipeline; whitelist accepted findings in `.trivyignore` |
+| 5 | ⚠️ open | **The GitHub PAT lands in the state file** (rendered into `user_data`) | Store the PAT in SSM Parameter Store; have the boot script fetch it so it never passes through Terraform/state |
+| 6 | ⚠️ open | **`IAMFullAccess` + `AmazonS3FullAccess` on `iac-user`** are over-broad | Replace with least-privilege policies scoped to this stack's resources and the state bucket only |
+| 7 | ⚠️ open | **Port 3000 open to `0.0.0.0/0`** | Restrict to known CIDRs, or front with an ALB + WAF. Juice Shop is *intentionally vulnerable* — do not expose it broadly |
+| 8 | ⚠️ open | **Long-lived PAT with repo-admin** rights | Shorten expiry and rotate; or use a GitHub App / ephemeral just-in-time runners |
+| 9 | ⚠️ open | **`AmazonSSMFullAccess` on the runner** is broader than needed | Scope to `ssm:SendCommand` on the specific document + target instance ARNs |
+| 10 | ⚠️ open | **Instances in public subnets** with public IPs | Move to private subnets — SSM works without inbound access, so no public IP is needed |
 
 **`.gitignore` covers `*.tfvars` and `*.tfstate`.** If either was ever committed, the secrets are in git history — rotate the AWS key and the PAT, don't just delete the file.
 
